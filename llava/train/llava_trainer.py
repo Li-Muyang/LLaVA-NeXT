@@ -12,11 +12,20 @@ from trl.trainer.utils import DPODataCollatorWithPadding
 
 from transformers import Trainer
 from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, ALL_LAYERNORM_LAYERS, logger, is_accelerate_available, is_datasets_available, GradientAccumulationPlugin
-from transformers.trainer_utils import seed_worker
+from transformers.trainer_utils import seed_worker, speed_metrics
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
-from typing import List, Optional
+from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
+from typing import List, Optional, Dict, Any, Union
 from datetime import timedelta
+
+from transformers.integrations import deepspeed_init
+from transformers import TrainerState
+from transformers.trainer_pt_utils import get_model_param_count
+from accelerate.utils import DistributedType
+import time
+import numpy as np
+import sys
 
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs
@@ -25,7 +34,10 @@ if is_datasets_available():
     import datasets
 
 from llava.utils import rank0_print
+from llava.train.cka_loss import cka_loss
 
+from transformers.utils import is_torch_xpu_available, is_torch_mlu_available, is_torch_musa_available, is_torch_npu_available, is_torch_mps_available, is_torch_xla_available
+import math
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -276,6 +288,18 @@ class LLaVATrainer(Trainer):
                 param.requires_grad = False  # Ensure no accidental gradient computation
 
         self.mezo_update_history = []
+        
+        # CKA loss: only for stage 1 (mm_tunable_parts contains only projector/resampler)
+        cka_requested = getattr(args, "use_cka_loss", False)
+        mm_tunable_parts = getattr(args, "mm_tunable_parts", "") or ""
+        is_stage1 = mm_tunable_parts and set(mm_tunable_parts.split(",")).issubset({"mm_mlp_adapter", "mm_vision_resampler"})
+        self.use_cka_loss = cka_requested and is_stage1
+        self.cka_loss_weight = getattr(args, "cka_loss_weight", 0.01)
+        self._cka_loss_sum = 0.0
+        self._cka_loss_count = 0
+        
+        if self.use_cka_loss:
+            rank0_print(f"CKA loss enabled (weight={self.cka_loss_weight})")
 
     ########################
     # MeZO-specific Methods
@@ -1035,7 +1059,7 @@ class LLaVATrainer(Trainer):
                     # Regular training step with gradient accumulation
                     with self.accelerator.accumulate(model):
                         tr_loss_step = self.training_step(model, inputs)
-                        print(f"Step {step} loss: {tr_loss_step}")
+                        # print(f"Step {step} loss: {tr_loss_step}")
 
                 torch.cuda.empty_cache()  # Releasing reserved memory seems not to work correctly, so do it manually
                 ########################
@@ -1228,6 +1252,114 @@ class LLaVATrainer(Trainer):
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+
+        inputs = self._prepare_inputs(inputs)
+        if is_sagemaker_mp_enabled():
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        with self.compute_loss_context_manager():
+            if self.use_cka_loss:
+                loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                cka_val = self._compute_cka_loss(outputs)
+                if cka_val is not None:
+                    loss = loss + self.cka_loss_weight * cka_val
+                    self._cka_loss_sum += cka_val.detach().item()
+                    self._cka_loss_count += 1
+            else:
+                loss = self.compute_loss(model, inputs)
+
+        del inputs
+        if (
+            self.args.torch_empty_cache_steps is not None
+            and self.state.global_step % self.args.torch_empty_cache_steps == 0
+        ):
+            if is_torch_xpu_available():
+                torch.xpu.empty_cache()
+            elif is_torch_mlu_available():
+                torch.mlu.empty_cache()
+            elif is_torch_musa_available():
+                torch.musa.empty_cache()
+            elif is_torch_npu_available():
+                torch.npu.empty_cache()
+            elif is_torch_mps_available(min_version="2.0"):
+                torch.mps.empty_cache()
+            else:
+                torch.cuda.empty_cache()
+
+        kwargs = {}
+
+        # For LOMO optimizers you need to explicitly use the learnign rate
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss, **kwargs)
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+    def _compute_cka_loss(self, outputs) -> Optional[torch.Tensor]:
+        """Compute CKA loss between vision and language features (local per-GPU, gradients sync via DeepSpeed)."""
+        vision_feats = getattr(outputs, 'vision_features_for_cka', None)
+        language_feats = getattr(outputs, 'language_features_for_cka', None)
+        
+        if vision_feats is None or language_feats is None:
+            return None
+        
+        # Flatten to 2D if needed
+        if vision_feats.dim() > 2:
+            vision_feats = vision_feats.view(-1, vision_feats.shape[-1])
+        if language_feats.dim() > 2:
+            language_feats = language_feats.view(-1, language_feats.shape[-1])
+        
+        if min(vision_feats.shape[0], language_feats.shape[0]) < 2:
+            return None
+        
+        return cka_loss(vision_feats, language_feats)
+
+    def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval):
+        if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            if is_torch_xla_available():
+                xm.mark_step()
+
+            logs: Dict[str, float] = {}
+
+            # all_gather + mean() to get average loss over all processes
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+
+            # reset tr_loss to zero
+            tr_loss -= tr_loss
+
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            if self.use_cka_loss and self._cka_loss_count > 0:
+                logs["cka_loss"] = round(self._cka_loss_sum / self._cka_loss_count, 4)
+                self._cka_loss_sum = 0.0
+                self._cka_loss_count = 0
+            if grad_norm is not None:
+                logs["grad_norm"] = grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            logs["learning_rate"] = self._get_learning_rate()
+
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            self.log(logs)
+
+        metrics = None
+        if self.control.should_evaluate:
+            metrics = self._evaluate(trial, ignore_keys_for_eval)
+
+        if self.control.should_save:
+            self._save_checkpoint(model, trial, metrics=metrics)
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
 class LLaVADPOTrainer(DPOTrainer):
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:

@@ -167,6 +167,15 @@ class TrainingArguments(transformers.TrainingArguments):
     trainer_mode: str = field(default="regular", metadata={"help": "Mode of training (`regular`, `zo`)."})
     zo_eps: float = field(default=1e-3, metadata={"help": "MeZO hyperparameter epsilon."})
     zo_num_directions: int = field(default=1, metadata={"help": "Number of directions for MeZO."})
+    # CKA Loss configuration
+    use_cka_loss: bool = field(
+        default=False, 
+        metadata={"help": "Enable CKA loss for vision-language feature alignment"}
+    )
+    cka_loss_weight: float = field(
+        default=0.01, 
+        metadata={"help": "Weight coefficient for CKA loss term"}
+    )
 
 
 # @dataclass
@@ -1571,7 +1580,7 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
     if model_args.vision_tower is not None:
-        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
+        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp, training_args=training_args)
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)

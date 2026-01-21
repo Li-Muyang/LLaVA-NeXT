@@ -51,7 +51,7 @@ class LlavaMetaModel:
             vision_tower = vision_tower[0]
         return vision_tower
 
-    def initialize_vision_modules(self, model_args, fsdp=None):
+    def initialize_vision_modules(self, model_args, fsdp=None, training_args=None):
         vision_tower = model_args.vision_tower
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
@@ -92,6 +92,14 @@ class LlavaMetaModel:
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
+
+        # cka loss related
+        try:
+            print("##### Running in CKA alignment mode. #####")
+            self.config.use_cka_loss = training_args.use_cka_loss
+            self.config.cka_loss_weight = training_args.cka_loss_weight
+        except:
+            print("##### Running in baseline alignment mode. #####")
 
         
         if not hasattr(self.config, 'add_faster_video'):
@@ -191,8 +199,16 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
-        # image_features = self.get_model().vision_resampler(image_features, images=images)
         image_features = self.get_model().mm_projector(image_features)
+        
+        # Cache for CKA if enabled and training
+        if getattr(self.config, "use_cka_loss", False) and self.training:
+            # Store flattened vision features for CKA computation on the model
+            # image_features shape: (num_images * num_patches, hidden_dim) or (num_images, num_patches, hidden_dim)
+            if image_features.dim() == 3:
+                self.get_model()._cached_vision_features = image_features.reshape(-1, image_features.shape[-1]).detach()
+            else:
+                self.get_model()._cached_vision_features = image_features.detach()
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
@@ -468,6 +484,12 @@ class LlavaMetaForCausalLM(ABC):
             split_sizes = [x.shape[0] for x in cur_labels_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+
+            # Cache language features for CKA (only text tokens, before merging with vision)
+            if getattr(self.config, "use_cka_loss", False) and self.training:
+                if not hasattr(self.get_model(), '_cached_language_features_list'):
+                    self.get_model()._cached_language_features_list = []
+                self.get_model()._cached_language_features_list.append(cur_input_embeds.reshape(-1, cur_input_embeds.shape[-1]).detach())
             cur_new_input_embeds = []
             cur_new_labels = []
 
@@ -552,6 +574,16 @@ class LlavaMetaForCausalLM(ABC):
             position_ids[:, split_position:] += right_add
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
+        # Consolidate cached features for CKA
+        if getattr(self.config, "use_cka_loss", False) and self.training:
+            # Concatenate all language features from the batch
+            model = self.get_model()
+            if hasattr(model, '_cached_language_features_list') and len(model._cached_language_features_list) > 0:
+                model._cached_language_features = torch.cat(model._cached_language_features_list, dim=0)
+                delattr(model, '_cached_language_features_list')
+            else:
+                model._cached_language_features = None
+
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
