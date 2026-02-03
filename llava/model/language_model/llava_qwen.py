@@ -16,6 +16,7 @@
 from typing import List, Optional, Tuple, Union, Dict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
 import transformers
@@ -27,6 +28,54 @@ from transformers.generation.utils import GenerateOutput
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
+
+
+def compute_relational_loss(visual_features: List[torch.Tensor], hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute relational alignment loss between projected visual features and LLM hidden states.
+    
+    Args:
+        visual_features: List of projected visual features, one tensor per sample [num_visual_tokens, hidden_dim]
+        hidden_states: LLM second-to-last layer hidden states [batch, seq_len, hidden_dim]
+        attention_mask: Attention mask [batch, seq_len]
+    
+    Returns:
+        MSE loss between pairwise cosine distance matrices
+    """
+    batch_size = len(visual_features)
+    if batch_size < 2:
+        return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+    
+    # Mean pool visual features per sample
+    visual_pooled = []
+    for vf in visual_features:
+        if vf.dim() == 2:
+            visual_pooled.append(vf.mean(dim=0))  # [hidden_dim]
+        else:
+            visual_pooled.append(vf.flatten(0, -2).mean(dim=0))  # Handle any shape
+    visual_pooled = torch.stack(visual_pooled)  # [batch, hidden_dim]
+    
+    # Mean pool hidden states per sample (masked)
+    # hidden_states: [batch, seq_len, hidden_dim]
+    mask = attention_mask.unsqueeze(-1).float()  # [batch, seq_len, 1]
+    hidden_pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)  # [batch, hidden_dim]
+    
+    # Normalize for cosine distance
+    visual_norm = F.normalize(visual_pooled, p=2, dim=-1)
+    hidden_norm = F.normalize(hidden_pooled, p=2, dim=-1)
+    
+    # Compute pairwise cosine similarity matrices
+    visual_sim = torch.mm(visual_norm, visual_norm.t())  # [batch, batch]
+    hidden_sim = torch.mm(hidden_norm, hidden_norm.t())  # [batch, batch]
+    
+    # Cosine distance = 1 - cosine similarity
+    visual_dist = 1 - visual_sim
+    hidden_dist = 1 - hidden_sim
+    
+    # MSE between distance matrices
+    loss = F.mse_loss(visual_dist, hidden_dist)
+    
+    return loss
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -60,6 +109,18 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    def _is_stage1_training(self) -> bool:
+        """Check if we are in Stage 1 (pretraining/alignment) based on config."""
+        # Stage 1: version == "plain" or only training mm_mlp_adapter
+        mm_tunable_parts = getattr(self.config, 'mm_tunable_parts', None)
+        tune_mm_mlp_adapter = getattr(self.config, 'tune_mm_mlp_adapter', False)
+        
+        if mm_tunable_parts == 'mm_mlp_adapter':
+            return True
+        if tune_mm_mlp_adapter and not getattr(self.config, 'unfreeze_mm_vision_tower', False):
+            return True
+        return False
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -78,6 +139,37 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         dpo_forward: Optional[bool] = False,
         cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        # Check if relational loss should be computed
+        relational_loss_weight = getattr(self.config, 'relational_loss_weight', 0.0)
+        compute_relational = (
+            self.training and 
+            relational_loss_weight > 0 and 
+            images is not None and 
+            self._is_stage1_training()
+        )
+        
+        # Store projected visual features if computing relational loss
+        projected_visual_features = None
+        if compute_relational and images is not None:
+            # Encode images to get projected features before prepare_inputs_labels_for_multimodal
+            # We need to manually encode to capture the projected features
+            if type(images) is list or images.ndim == 5:
+                if type(images) is list:
+                    images_list = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+                else:
+                    images_list = [images]
+                concat_images = torch.cat([img for img in images_list], dim=0)
+                split_sizes = [img.shape[0] for img in images_list]
+                # Get projected features
+                image_features = self.get_model().get_vision_tower()(concat_images)
+                projected_visual_features = self.get_model().mm_projector(image_features)
+                # Split back to per-sample
+                projected_visual_features = list(torch.split(projected_visual_features, split_sizes, dim=0))
+            else:
+                image_features = self.get_model().get_vision_tower()(images)
+                projected_visual_features = self.get_model().mm_projector(image_features)
+                projected_visual_features = [projected_visual_features]
 
         if inputs_embeds is None:
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
@@ -99,19 +191,43 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             logits = self.lm_head(hidden_states)
             return logits, labels
 
-        else:
-            return super().forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+        # For relational loss, we need hidden states
+        if compute_relational:
+            output_hidden_states = True
+
+        outputs = super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,  # Need dict to access hidden_states
+        )
+
+        # Compute and add relational loss
+        if compute_relational and projected_visual_features is not None and outputs.hidden_states is not None:
+            # Get second-to-last layer hidden states
+            second_to_last_hidden = outputs.hidden_states[-2]  # [batch, seq_len, hidden_dim]
+            
+            rel_loss = compute_relational_loss(
+                projected_visual_features, 
+                second_to_last_hidden, 
+                attention_mask
             )
+            
+            # Add weighted relational loss to total loss
+            if outputs.loss is not None:
+                outputs.loss = outputs.loss + relational_loss_weight * rel_loss
+
+        # Convert back to tuple if return_dict is False
+        if return_dict is False:
+            return outputs.to_tuple()
+        
+        return outputs
 
     @torch.no_grad()
     def generate(

@@ -113,6 +113,22 @@ class ModelArguments:
     add_faster_video: Optional[bool] = field(default=False)
     faster_token_stride: Optional[int] = field(default=10)
 
+    # Relational alignment loss (Stage 1 only)
+    relational_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for relational alignment loss during Stage 1 pretraining. Set > 0 to enable."}
+    )
+
+    # Full fine-tuning of vision encoder (without MLP projector)
+    full_finetune_vision_encoder: bool = field(
+        default=False,
+        metadata={"help": "Enable full parameter fine-tuning of vision encoder. When enabled, MLP projector is replaced with identity (passthrough)."}
+    )
+    full_finetune_vision_stages: str = field(
+        default="1,2",
+        metadata={"help": "Stages to enable full vision encoder fine-tuning: '1' (pretrain only), '2' (finetune only), or '1,2' (both stages)"}
+    )
+
 
 
 @dataclass
@@ -1611,6 +1627,9 @@ def train(attn_implementation=None):
         model.config.force_sample = data_args.force_sample
         model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride
 
+        # Relational alignment loss (Stage 1 only)
+        model.config.relational_loss_weight = model_args.relational_loss_weight
+
         ### Deciding train which part of the model
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
             model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
@@ -1664,6 +1683,13 @@ def train(attn_implementation=None):
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         param.requires_grad_(True)
+
+        # Handle full vision encoder fine-tuning mode
+        if getattr(model.config, "full_finetune_vision_encoder", False):
+            rank0_print("[Full Vision Finetune] Unfreezing vision tower parameters")
+            vision_tower.requires_grad_(True)
+            # Freeze the MLP projector (identity) since it has no learnable parameters anyway
+            model.get_model().mm_projector.requires_grad_(False)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

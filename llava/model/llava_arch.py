@@ -31,6 +31,41 @@ from llava.utils import rank0_print, rank_print
 import random
 
 
+def should_use_full_finetune_vision(model_args):
+    """
+    Determine if full vision encoder fine-tuning should be enabled based on model_args.
+    
+    Returns True if:
+    - full_finetune_vision_encoder is True AND
+    - Current stage is in full_finetune_vision_stages
+    
+    Stage detection:
+    - Stage 1 (pretrain): version == "plain" or mm_tunable_parts == "mm_mlp_adapter"
+    - Stage 2 (finetune): other configurations
+    """
+    if not getattr(model_args, 'full_finetune_vision_encoder', False):
+        return False
+    
+    stages = getattr(model_args, 'full_finetune_vision_stages', '1,2')
+    allowed_stages = [s.strip() for s in stages.split(',')]
+    
+    # Detect current stage
+    version = getattr(model_args, 'version', '')
+    mm_tunable_parts = getattr(model_args, 'mm_tunable_parts', None)
+    
+    # Stage 1 detection: plain version or only training mm_mlp_adapter
+    is_stage1 = (version == 'plain') or (mm_tunable_parts == 'mm_mlp_adapter')
+    
+    current_stage = '1' if is_stage1 else '2'
+    
+    if current_stage in allowed_stages:
+        rank0_print(f"[Full Vision Finetune] Enabled for stage {current_stage} (allowed stages: {allowed_stages})")
+        return True
+    else:
+        rank0_print(f"[Full Vision Finetune] Disabled for stage {current_stage} (allowed stages: {allowed_stages})")
+        return False
+
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -60,6 +95,10 @@ class LlavaMetaModel:
 
         self.config.mm_vision_tower = vision_tower
         self.config.vision_tower_pretrained = getattr(model_args, "vision_tower_pretrained", "")
+        
+        # Check if full vision encoder fine-tuning is enabled
+        use_full_finetune_vision = should_use_full_finetune_vision(model_args)
+        self.config.full_finetune_vision_encoder = use_full_finetune_vision
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
@@ -87,7 +126,14 @@ class LlavaMetaModel:
                 p.requires_grad = True
 
         self.config.use_mm_proj = True
-        self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
+        
+        # When full vision encoder fine-tuning is enabled, use identity projector
+        if use_full_finetune_vision:
+            self.config.mm_projector_type = "identity"
+            rank0_print("[Full Vision Finetune] Using identity projector (no MLP projection)")
+        else:
+            self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
+        
         self.config.mm_hidden_size = getattr(vision_resampler, "hidden_size", vision_tower.hidden_size)
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
@@ -112,7 +158,8 @@ class LlavaMetaModel:
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
 
-        if pretrain_mm_mlp_adapter is not None:
+        # Skip loading pretrained adapter weights when using full vision finetune (identity projector)
+        if pretrain_mm_mlp_adapter is not None and not use_full_finetune_vision:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location="cpu")
 
             def get_w(weights, keyword):
