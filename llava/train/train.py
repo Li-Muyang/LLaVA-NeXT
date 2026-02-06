@@ -37,7 +37,7 @@ import transformers
 import tokenizers
 import deepspeed
 
-from transformers import AutoConfig
+from transformers import AutoConfig, TrainerCallback
 from torch.utils.data import Dataset
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from llava.train.llava_trainer import LLaVATrainer
@@ -53,6 +53,25 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 local_rank = None
 
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse("0.14")
+
+
+class RelationalLossLoggingCallback(TrainerCallback):
+    """Callback to log relational loss separately for WandB and other logging backends."""
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Called when logging metrics."""
+        if logs is None:
+            return
+        
+        model = kwargs.get('model')
+        if model is None:
+            return
+        
+        # Check if model has a stored relational loss value
+        if hasattr(model, '_last_relational_loss') and model._last_relational_loss is not None:
+            logs['relational_loss'] = model._last_relational_loss
+            # Reset after logging
+            model._last_relational_loss = None
 
 
 @dataclass
@@ -1721,6 +1740,11 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+
+    # Register relational loss logging callback
+    if model_args.relational_loss_weight > 0:
+        trainer.add_callback(RelationalLossLoggingCallback())
+        rank0_print(f"Relational loss logging enabled (weight={model_args.relational_loss_weight})")
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

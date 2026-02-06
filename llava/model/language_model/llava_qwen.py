@@ -219,6 +219,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 attention_mask
             )
             
+            # Store for logging callback
+            self._last_relational_loss = rel_loss.item()
+            
             # Add weighted relational loss to total loss
             if outputs.loss is not None:
                 outputs.loss = outputs.loss + relational_loss_weight * rel_loss
